@@ -68,6 +68,80 @@ const categories = [
   }
 ]
 
+// Customer price ko Indian currency format mein dikhata hai.
+// Example: 30000/day -> ₹30,000/day
+const formatCustomerPrice = (value) => {
+  const price = String(value || '').trim()
+
+  if (!price) return 'Price on request'
+  if (price.startsWith('₹')) return price
+
+  const match = price.match(/^([\d,]+(?:\.\d+)?)(.*)$/)
+
+  if (!match) return price
+
+  const amount = Number(match[1].replace(/,/g, ''))
+
+  if (!Number.isFinite(amount)) return price
+
+  const formattedAmount = new Intl.NumberFormat('en-IN', {
+    maximumFractionDigits: 2
+  }).format(amount)
+
+  return `₹${formattedAmount}${match[2]}`
+}
+
+const mapSupplierRow = (item) => ({
+  id: item.id,
+  company: item.company,
+  owner: item.owner,
+  phone: item.phone,
+  equipment: item.equipment,
+  mode: item.mode,
+  district: item.district,
+  supplierPrice: item.supplier_price,
+  capacity: item.capacity,
+  condition: item.condition,
+  description: item.description,
+  customerPrice: item.customer_price || '',
+  status: item.status,
+  date: item.created_at
+    ? new Date(item.created_at).toLocaleString('en-IN')
+    : ''
+})
+
+const mapEnquiryRow = (item) => ({
+  id: item.id,
+  name: item.name,
+  phone: item.phone,
+  mode: item.mode,
+  equipment: item.equipment,
+  district: item.district,
+  duration: item.duration,
+  budget: item.budget,
+  details: item.details,
+  date: item.created_at
+    ? new Date(item.created_at).toLocaleString('en-IN')
+    : ''
+})
+
+const mapPublicRow = (item) => ({
+  id: item.submission_id || item.id,
+  publicId: item.id,
+  equipment: item.equipment,
+  mode: item.mode,
+  district: item.district,
+  capacity: item.capacity,
+  condition: item.condition,
+  description: item.description,
+  customerPrice: item.customer_price,
+  photoUrl: item.photo_path
+    ? supabase.storage
+      .from('crane-photos')
+      .getPublicUrl(item.photo_path).data.publicUrl
+    : ''
+})
+
 function App() {
   const [listings, setListings] = useState([])
   const [publicListings, setPublicListings] = useState([])
@@ -84,7 +158,121 @@ function App() {
   const [search, setSearch] = useState('')
   const [notice, setNotice] = useState('')
 
-  // Admin authentication + shared Supabase data loading.
+  // Supplier edit ke liye selected submission ID.
+  const [editingId, setEditingId] = useState('')
+
+  // Admin data ko alag-alag load karte hain.
+  // Customer enquiry ya public listing query fail hone par
+  // supplier submissions load hona band nahi hoga.
+  const refreshAdminData = async () => {
+    const [
+      { data: supplierRows, error: supplierError },
+      { data: enquiryRows, error: enquiryError },
+      { data: publicRows, error: publicError }
+    ] = await Promise.all([
+      supabase
+        .from('supplier_submissions')
+        .select('*')
+        .order('created_at', { ascending: false }),
+
+      supabase
+        .from('customer_enquiries')
+        .select('*')
+        .order('created_at', { ascending: false }),
+
+      supabase
+        .from('public_cranes')
+        .select('*')
+        .order('created_at', { ascending: false })
+    ])
+
+    // Supplier submissions sabse important hain.
+    if (supplierError) throw supplierError
+
+    setListings((supplierRows || []).map(mapSupplierRow))
+
+    if (enquiryError) {
+      console.error('Customer enquiries loading failed:', enquiryError)
+    } else {
+      setEnquiries((enquiryRows || []).map(mapEnquiryRow))
+    }
+
+    if (publicError) {
+      console.error('Public listings loading failed:', publicError)
+    } else {
+      setPublicListings((publicRows || []).map(mapPublicRow))
+    }
+  }
+
+  // Admin logged in hone par realtime updates + 10-second fallback.
+  // Isse doosre device se aayi supplier submission dashboard mein aayegi.
+  useEffect(() => {
+    if (!adminUser) return
+
+    let active = true
+
+    const loadLatestData = async () => {
+      try {
+        await refreshAdminData()
+      } catch (error) {
+        console.error('Admin refresh failed:', error)
+
+        if (active) {
+          setNotice(`Supplier data loading failed: ${error.message}`)
+        }
+      }
+    }
+
+    const channel = supabase
+      .channel('craneseva-admin-live-updates')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'supplier_submissions'
+        },
+        () => {
+          loadLatestData()
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'public_cranes'
+        },
+        () => {
+          loadLatestData()
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'customer_enquiries'
+        },
+        () => {
+          loadLatestData()
+        }
+      )
+      .subscribe()
+
+    // Realtime ke alawa fallback polling.
+    const interval = window.setInterval(() => {
+      loadLatestData()
+    }, 10000)
+
+    return () => {
+      active = false
+      window.clearInterval(interval)
+      supabase.removeChannel(channel)
+    }
+  }, [adminUser])
+
+  // Authentication + public listings.
   useEffect(() => {
     let mounted = true
 
@@ -96,86 +284,44 @@ function App() {
 
       if (error) throw error
 
-      return (data || []).map(item => ({
-        id: item.submission_id || item.id,
-        publicId: item.id,
-        equipment: item.equipment,
-        mode: item.mode,
-        district: item.district,
-        capacity: item.capacity,
-        condition: item.condition,
-        description: item.description,
-        customerPrice: item.customer_price,
-        photoUrl: item.photo_path
-          ? supabase.storage
-            .from('crane-photos')
-            .getPublicUrl(item.photo_path).data.publicUrl
-          : ''
-      }))
+      return (data || []).map(mapPublicRow)
     }
 
     const loadData = async (isAdmin) => {
       try {
-        const publicRows = await loadPublicListings()
+        // Public listings independently load honge.
+        try {
+          const publicRows = await loadPublicListings()
 
-        if (!mounted) return
-
-        setPublicListings(publicRows)
+          if (mounted) setPublicListings(publicRows)
+        } catch (error) {
+          console.error('Public listings loading failed:', error)
+        }
 
         if (isAdmin) {
-          const [
-            { data: supplierRows, error: supplierError },
-            { data: enquiryRows, error: enquiryError }
-          ] = await Promise.all([
-            supabase
+          const { data: supplierRows, error: supplierError } =
+            await supabase
               .from('supplier_submissions')
               .select('*')
-              .order('created_at', { ascending: false }),
+              .order('created_at', { ascending: false })
 
-            supabase
+          if (supplierError) throw supplierError
+
+          if (mounted) {
+            setListings((supplierRows || []).map(mapSupplierRow))
+          }
+
+          const { data: enquiryRows, error: enquiryError } =
+            await supabase
               .from('customer_enquiries')
               .select('*')
               .order('created_at', { ascending: false })
-          ])
 
-          if (supplierError) throw supplierError
-          if (enquiryError) throw enquiryError
-
-          if (!mounted) return
-
-          setListings((supplierRows || []).map(item => ({
-            id: item.id,
-            company: item.company,
-            owner: item.owner,
-            phone: item.phone,
-            equipment: item.equipment,
-            mode: item.mode,
-            district: item.district,
-            supplierPrice: item.supplier_price,
-            capacity: item.capacity,
-            condition: item.condition,
-            description: item.description,
-            customerPrice: item.customer_price || '',
-            status: item.status,
-            date: item.created_at
-              ? new Date(item.created_at).toLocaleString('en-IN')
-              : ''
-          })))
-
-          setEnquiries((enquiryRows || []).map(item => ({
-            id: item.id,
-            name: item.name,
-            phone: item.phone,
-            mode: item.mode,
-            equipment: item.equipment,
-            district: item.district,
-            duration: item.duration,
-            budget: item.budget,
-            details: item.details,
-            date: item.created_at
-              ? new Date(item.created_at).toLocaleString('en-IN')
-              : ''
-          })))
+          if (enquiryError) {
+            console.error('Enquiries loading failed:', enquiryError)
+          } else if (mounted) {
+            setEnquiries((enquiryRows || []).map(mapEnquiryRow))
+          }
         }
       } catch (error) {
         console.error('CraneSeva data loading failed:', error)
@@ -198,10 +344,9 @@ function App() {
         if (error) throw error
 
         if (!session?.user) {
-          if (mounted) {
-            setAdminUser(null)
-            await loadData(false)
-          }
+          if (mounted) setAdminUser(null)
+
+          await loadData(false)
           return
         }
 
@@ -250,6 +395,7 @@ function App() {
         setAdminView(false)
         setListings([])
         setEnquiries([])
+        setEditingId('')
       }
     })
 
@@ -284,90 +430,67 @@ function App() {
 
     setAdminUser(null)
     setAdminView(false)
+    setEditingId('')
 
     window.scrollTo({ top: 0, behavior: 'smooth' })
     setNotice('Admin logged out successfully.')
   }
 
-  const refreshAdminData = async () => {
-    const [
-      { data: supplierRows, error: supplierError },
-      { data: enquiryRows, error: enquiryError },
-      { data: publicRows, error: publicError }
-    ] = await Promise.all([
-      supabase
+  // Supplier ki details admin edit kar sakta hai.
+  const saveSupplierEdit = async (e, id) => {
+    e.preventDefault()
+
+    const form = e.currentTarget
+    const data = new FormData(form)
+
+    const phone = String(data.get('phone') || '').trim()
+
+    if (!/^[0-9]{10}$/.test(phone)) {
+      setNotice('Please enter a valid 10-digit supplier mobile number.')
+      return
+    }
+
+    const updatedDetails = {
+      company: String(data.get('company') || '').trim(),
+      owner: String(data.get('owner') || '').trim(),
+      phone,
+      equipment: String(data.get('equipment') || '').trim(),
+      mode: String(data.get('mode') || '').trim(),
+      district: String(data.get('district') || '').trim(),
+      supplier_price:
+        String(data.get('supplierPrice') || '').trim() || null,
+      capacity:
+        String(data.get('capacity') || '').trim() || null,
+      condition:
+        String(data.get('condition') || '').trim() || null,
+      description:
+        String(data.get('description') || '').trim() || null
+    }
+
+    setBusyId(id)
+
+    try {
+      const { error } = await supabase
         .from('supplier_submissions')
-        .select('*')
-        .order('created_at', { ascending: false }),
+        .update(updatedDetails)
+        .eq('id', id)
 
-      supabase
-        .from('customer_enquiries')
-        .select('*')
-        .order('created_at', { ascending: false }),
+      if (error) throw error
 
-      supabase
-        .from('public_cranes')
-        .select('*')
-        .order('created_at', { ascending: false })
-    ])
+      await refreshAdminData()
 
-    if (supplierError) throw supplierError
-    if (enquiryError) throw enquiryError
-    if (publicError) throw publicError
+      setEditingId('')
+      setNotice('Supplier details updated successfully.')
 
-    setListings((supplierRows || []).map(item => ({
-      id: item.id,
-      company: item.company,
-      owner: item.owner,
-      phone: item.phone,
-      equipment: item.equipment,
-      mode: item.mode,
-      district: item.district,
-      supplierPrice: item.supplier_price,
-      capacity: item.capacity,
-      condition: item.condition,
-      description: item.description,
-      customerPrice: item.customer_price || '',
-      status: item.status,
-      date: item.created_at
-        ? new Date(item.created_at).toLocaleString('en-IN')
-        : ''
-    })))
-
-    setEnquiries((enquiryRows || []).map(item => ({
-      id: item.id,
-      name: item.name,
-      phone: item.phone,
-      mode: item.mode,
-      equipment: item.equipment,
-      district: item.district,
-      duration: item.duration,
-      budget: item.budget,
-      details: item.details,
-      date: item.created_at
-        ? new Date(item.created_at).toLocaleString('en-IN')
-        : ''
-    })))
-
-    setPublicListings((publicRows || []).map(item => ({
-      id: item.submission_id || item.id,
-      publicId: item.id,
-      equipment: item.equipment,
-      mode: item.mode,
-      district: item.district,
-      capacity: item.capacity,
-      condition: item.condition,
-      description: item.description,
-      customerPrice: item.customer_price,
-      photoUrl: item.photo_path
-        ? supabase.storage
-          .from('crane-photos')
-          .getPublicUrl(item.photo_path).data.publicUrl
-        : ''
-    })))
+    } catch (error) {
+      console.error('Supplier edit failed:', error)
+      setNotice(`Could not update supplier details: ${error.message}`)
+    } finally {
+      setBusyId('')
+    }
   }
 
-  // Public supplier form: submissions are stored privately in Supabase.
+  // Public supplier form.
   const saveSupplierLead = async (e) => {
     e.preventDefault()
 
@@ -517,6 +640,7 @@ function App() {
       setBusyId('')
     }
   }
+
   const unpublishListing = async (id) => {
     if (!window.confirm('Remove this equipment from the public marketplace?')) {
       return
@@ -774,6 +898,7 @@ function App() {
             <div className="admin-warning">
               LIVE DATABASE MODE — Supplier submissions, customer enquiries
               and published equipment are connected to Supabase.
+              Dashboard automatically refreshes every 10 seconds.
             </div>
 
             <button
@@ -871,6 +996,151 @@ function App() {
                           Open CraneSeva WhatsApp ↗
                         </button>
 
+                        {/* EDIT SUPPLIER DETAILS */}
+                        <button
+                          className="outline-action"
+                          type="button"
+                          disabled={busyId === item.id}
+                          onClick={() => {
+                            setEditingId(
+                              editingId === item.id ? '' : item.id
+                            )
+                          }}
+                        >
+                          {editingId === item.id
+                            ? 'Cancel Edit'
+                            : 'Edit Supplier Details'}
+                        </button>
+
+                        {editingId === item.id && (
+                          <form
+                            className="publish-form"
+                            onSubmit={e => saveSupplierEdit(e, item.id)}
+                          >
+                            <h3>Edit Supplier Details</h3>
+
+                            <label>
+                              Company / Owner Name
+                              <input
+                                name="company"
+                                defaultValue={item.company || ''}
+                                required
+                              />
+                            </label>
+
+                            <label>
+                              Contact Person
+                              <input
+                                name="owner"
+                                defaultValue={item.owner || ''}
+                                required
+                              />
+                            </label>
+
+                            <label>
+                              Mobile Number
+                              <input
+                                name="phone"
+                                type="tel"
+                                inputMode="numeric"
+                                pattern="[0-9]{10}"
+                                maxLength="10"
+                                defaultValue={item.phone || ''}
+                                required
+                              />
+                            </label>
+
+                            <label>
+                              Equipment Type
+                              <select
+                                name="equipment"
+                                defaultValue={item.equipment || ''}
+                                required
+                              >
+                                {equipmentTypes.map(x => (
+                                  <option key={x} value={x}>{x}</option>
+                                ))}
+                              </select>
+                            </label>
+
+                            <label>
+                              Service Type
+                              <select
+                                name="mode"
+                                defaultValue={item.mode || ''}
+                                required
+                              >
+                                <option value="Rental">Rental</option>
+                                <option value="Sale">Sale</option>
+                                <option value="Both">Rental + Sale</option>
+                              </select>
+                            </label>
+
+                            <label>
+                              Equipment Location
+                              <select
+                                name="district"
+                                defaultValue={item.district || ''}
+                                required
+                              >
+                                {districts.map(x => (
+                                  <option key={x} value={x}>{x}</option>
+                                ))}
+                              </select>
+                            </label>
+
+                            <label>
+                              Supplier Rate
+                              <input
+                                name="supplierPrice"
+                                defaultValue={item.supplierPrice || ''}
+                                placeholder="e.g. ₹25,000/day"
+                              />
+                            </label>
+
+                            <label>
+                              Capacity / Model
+                              <input
+                                name="capacity"
+                                defaultValue={item.capacity || ''}
+                              />
+                            </label>
+
+                            <label>
+                              Equipment Condition
+                              <select
+                                name="condition"
+                                defaultValue={item.condition || ''}
+                              >
+                                <option value="">Select condition</option>
+                                <option>Brand New</option>
+                                <option>Excellent</option>
+                                <option>Good</option>
+                                <option>Used</option>
+                              </select>
+                            </label>
+
+                            <label>
+                              Machine Details
+                              <textarea
+                                name="description"
+                                rows="3"
+                                defaultValue={item.description || ''}
+                              />
+                            </label>
+
+                            <button
+                              className="submit-btn"
+                              type="submit"
+                              disabled={busyId === item.id}
+                            >
+                              {busyId === item.id
+                                ? 'Saving...'
+                                : 'Save Supplier Details'}
+                            </button>
+                          </form>
+                        )}
+
                         <form
                           className="publish-form"
                           onSubmit={e => publishListing(e, item.id)}
@@ -880,10 +1150,14 @@ function App() {
                             <input
                               name="customerPrice"
                               defaultValue={item.customerPrice}
-                              placeholder="e.g. ₹30,000 per day"
+                              placeholder="e.g. 30000/day"
                               required
                             />
                           </label>
+
+                          <small>
+                            Example: 30000/day will appear publicly as ₹30,000/day.
+                          </small>
 
                           <label>
                             Upload Real Equipment Photo *
@@ -951,7 +1225,10 @@ function App() {
                       <h3>{item.equipment}</h3>
 
                       <p><b>Location:</b> {item.district}, MP</p>
-                      <p><b>Customer price:</b> {item.customerPrice}</p>
+                      <p>
+                        <b>Customer price:</b>{' '}
+                        {formatCustomerPrice(item.customerPrice)}
+                      </p>
 
                       <button
                         className="delete-action"
@@ -1028,7 +1305,8 @@ function App() {
 
         </main>
 
-      ) : (        /* PUBLIC WEBSITE */
+      ) : (
+        /* PUBLIC WEBSITE */
         <>
 
           {/* HERO */}
@@ -1252,7 +1530,7 @@ function App() {
                         )}
 
                         <strong className="price">
-                          {item.customerPrice}
+                          {formatCustomerPrice(item.customerPrice)}
                         </strong>
 
                         <a
@@ -1310,6 +1588,7 @@ function App() {
               </div>
             </div>
           </section>
+
           {/* CUSTOMER ENQUIRY */}
           <section className="enquiry-section" id="enquiry">
             <div className="enquiry-copy">
