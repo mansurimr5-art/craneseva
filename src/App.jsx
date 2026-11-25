@@ -1,3 +1,4 @@
+
 import { useState, useEffect } from 'react'
 import './App.css'
 import AdminLogin from './AdminLogin'
@@ -68,15 +69,15 @@ const categories = [
   }
 ]
 
-// Customer price ko Indian currency format mein dikhata hai.
-// Example: 30000/day -> ₹30,000/day
+// Price ko Indian currency format mein dikhata hai.
+// 30000/day -> ₹30,000/day
+// 250000/month -> ₹2,50,000/month
 const formatCustomerPrice = (value) => {
   const price = String(value || '').trim()
 
   if (!price) return 'Price on request'
-  if (price.startsWith('₹')) return price
 
-  const match = price.match(/^([\d,]+(?:\.\d+)?)(.*)$/)
+  const match = price.match(/^₹?\s*([\d,]+(?:\.\d+)?)(.*)$/)
 
   if (!match) return price
 
@@ -89,6 +90,21 @@ const formatCustomerPrice = (value) => {
   }).format(amount)
 
   return `₹${formattedAmount}${match[2]}`
+}
+
+const getPriceUnit = (value) => {
+  const price = String(value || '').toLowerCase()
+
+  if (/\/\s*(month|monthly)\s*$/.test(price)) return 'month'
+  if (/\/\s*(day|daily)\s*$/.test(price)) return 'day'
+
+  return 'day'
+}
+
+const getPriceWithoutUnit = (value) => {
+  return String(value || '')
+    .replace(/\/\s*(day|daily|month|monthly)\s*$/i, '')
+    .trim()
 }
 
 const mapSupplierRow = (item) => ({
@@ -158,12 +174,9 @@ function App() {
   const [search, setSearch] = useState('')
   const [notice, setNotice] = useState('')
 
-  // Supplier edit ke liye selected submission ID.
   const [editingId, setEditingId] = useState('')
 
-  // Admin data ko alag-alag load karte hain.
-  // Customer enquiry ya public listing query fail hone par
-  // supplier submissions load hona band nahi hoga.
+  // Admin ke liye live database refresh.
   const refreshAdminData = async () => {
     const [
       { data: supplierRows, error: supplierError },
@@ -186,7 +199,6 @@ function App() {
         .order('created_at', { ascending: false })
     ])
 
-    // Supplier submissions sabse important hain.
     if (supplierError) throw supplierError
 
     setListings((supplierRows || []).map(mapSupplierRow))
@@ -204,8 +216,7 @@ function App() {
     }
   }
 
-  // Admin logged in hone par realtime updates + 10-second fallback.
-  // Isse doosre device se aayi supplier submission dashboard mein aayegi.
+  // Realtime updates + 10-second refresh.
   useEffect(() => {
     if (!adminUser) return
 
@@ -232,9 +243,7 @@ function App() {
           schema: 'public',
           table: 'supplier_submissions'
         },
-        () => {
-          loadLatestData()
-        }
+        () => loadLatestData()
       )
       .on(
         'postgres_changes',
@@ -243,9 +252,7 @@ function App() {
           schema: 'public',
           table: 'public_cranes'
         },
-        () => {
-          loadLatestData()
-        }
+        () => loadLatestData()
       )
       .on(
         'postgres_changes',
@@ -254,16 +261,11 @@ function App() {
           schema: 'public',
           table: 'customer_enquiries'
         },
-        () => {
-          loadLatestData()
-        }
+        () => loadLatestData()
       )
       .subscribe()
 
-    // Realtime ke alawa fallback polling.
-    const interval = window.setInterval(() => {
-      loadLatestData()
-    }, 10000)
+    const interval = window.setInterval(loadLatestData, 10000)
 
     return () => {
       active = false
@@ -272,7 +274,7 @@ function App() {
     }
   }, [adminUser])
 
-  // Authentication + public listings.
+  // Authentication aur public listings.
   useEffect(() => {
     let mounted = true
 
@@ -289,7 +291,6 @@ function App() {
 
     const loadData = async (isAdmin) => {
       try {
-        // Public listings independently load honge.
         try {
           const publicRows = await loadPublicListings()
 
@@ -436,7 +437,7 @@ function App() {
     setNotice('Admin logged out successfully.')
   }
 
-  // Supplier ki details admin edit kar sakta hai.
+  // Supplier details edit.
   const saveSupplierEdit = async (e, id) => {
     e.preventDefault()
 
@@ -490,7 +491,7 @@ function App() {
     }
   }
 
-  // Public supplier form.
+  // Supplier public form.
   const saveSupplierLead = async (e) => {
     e.preventDefault()
 
@@ -538,21 +539,39 @@ function App() {
     )
   }
 
-  // Admin uploads the real supplier photo, sets customer price, then publishes.
+  // Admin price + selected rental unit + original crane photo.
   const publishListing = async (e, id) => {
     e.preventDefault()
 
     const form = e.currentTarget
     const data = new FormData(form)
 
-    const customerPrice = String(
+    const rawCustomerPrice = String(
       data.get('customerPrice') || ''
     ).trim()
 
+    const priceUnit = String(
+      data.get('priceUnit') || 'day'
+    )
+
+    const baseCustomerPrice = rawCustomerPrice
+      .replace(/\/\s*(day|daily|month|monthly)\s*$/i, '')
+      .trim()
+
+    const customerPrice = `${baseCustomerPrice}/${priceUnit}`
+
     const photo = data.get('photo')
 
-    if (!customerPrice) {
+    if (!baseCustomerPrice) {
       return setNotice('Please enter the customer price.')
+    }
+
+    if (!/^[₹]?\s*[\d,]+(?:\.\d+)?$/.test(baseCustomerPrice)) {
+      return setNotice('Please enter a valid price, for example 30000.')
+    }
+
+    if (!['day', 'month'].includes(priceUnit)) {
+      return setNotice('Please select Daily or Monthly pricing.')
     }
 
     if (!(photo instanceof File) || !photo.size) {
@@ -574,9 +593,7 @@ function App() {
 
       const photoPath = `${id}/${Date.now()}.${ext}`
 
-      const {
-        error: uploadError
-      } = await supabase.storage
+      const { error: uploadError } = await supabase.storage
         .from('crane-photos')
         .upload(photoPath, photo, {
           contentType: photo.type,
@@ -593,9 +610,7 @@ function App() {
         )
       }
 
-      const {
-        error: publicError
-      } = await supabase
+      const { error: publicError } = await supabase
         .from('public_cranes')
         .upsert({
           submission_id: id,
@@ -613,9 +628,7 @@ function App() {
 
       if (publicError) throw publicError
 
-      const {
-        error: updateError
-      } = await supabase
+      const { error: updateError } = await supabase
         .from('supplier_submissions')
         .update({
           customer_price: customerPrice,
@@ -996,7 +1009,6 @@ function App() {
                           Open CraneSeva WhatsApp ↗
                         </button>
 
-                        {/* EDIT SUPPLIER DETAILS */}
                         <button
                           className="outline-action"
                           type="button"
@@ -1149,14 +1161,27 @@ function App() {
                             CraneSeva Customer Price *
                             <input
                               name="customerPrice"
-                              defaultValue={item.customerPrice}
-                              placeholder="e.g. 30000/day"
+                              defaultValue={getPriceWithoutUnit(item.customerPrice)}
+                              placeholder="e.g. 30000"
+                              inputMode="decimal"
                               required
                             />
                           </label>
 
+                          <label>
+                            Rental Pricing Type *
+                            <select
+                              name="priceUnit"
+                              defaultValue={getPriceUnit(item.customerPrice)}
+                              required
+                            >
+                              <option value="day">Daily</option>
+                              <option value="month">Monthly</option>
+                            </select>
+                          </label>
+
                           <small>
-                            Example: 30000/day will appear publicly as ₹30,000/day.
+                            Example: ₹30,000/day or ₹2,50,000/month.
                           </small>
 
                           <label>
